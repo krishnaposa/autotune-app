@@ -1,0 +1,37 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+
+buildscript {
+  repositories {
+    google()
+    mavenCentral()
+  }
+  dependencies {
+    classpath('com.android.tools.build:gradle')
+    classpath('com.facebook.react:react-native-gradle-plugin')
+    classpath('org.jetbrains.kotlin:kotlin-gradle-plugin')
+  }
+}
+
+allprojects {
+  repositories {
+    google()
+    mavenCentral()
+    maven { url 'https://www.jitpack.io' }
+  }
+}
+
+apply plugin: "expo-root-project"
+apply plugin: "com.facebook.react.rootproject"
+
+// Gradle / Android Studio do not set NODE_ENV; @expo/env warns when expo-constants:createExpoConfig runs node.
+// Use lazy task matching (no afterEvaluate) so this works when the root project is evaluated late.
+subprojects { subproject ->
+  subproject.tasks.matching { it.name == 'createExpoConfig' }.configureEach { task ->
+    if (task instanceof org.gradle.api.tasks.Exec) {
+      def fromEnv = System.getenv('NODE_ENV')
+      def isReleaseLike = gradle.startParameter.taskRequests.toString().toLowerCase().contains('release')
+      def fallback = isReleaseLike ? 'production' : 'development'
+      task.environment 'NODE_ENV', (fromEnv != null && !fromEnv.isEmpty()) ? fromEnv : fallback
+    }
+  }
+}
