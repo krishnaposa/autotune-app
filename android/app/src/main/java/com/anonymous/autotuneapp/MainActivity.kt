@@ -4,6 +4,7 @@ import expo.modules.splashscreen.SplashScreenManager
 import android.os.Build
 import android.os.Bundle
 
+import androidx.appcompat.app.AppCompatActivity
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
@@ -61,5 +62,16 @@ class MainActivity : ReactActivity() {
       // Use the default back button implementation on Android S
       // because it's doing more than [Activity.moveTaskToBack] in fact.
       super.invokeDefaultOnBackPressed()
+  }
+
+  /**
+   * Do not call [ReactActivity.onUserLeaveHint]: it forwards to [ReactActivityDelegate.onUserLeaveHint],
+   * which does `requireNonNull(mReactDelegate)`. Expo's [ReactActivityDelegateWrapper] can run that after
+   * `loadAppReady` while the inner delegate's `mReactDelegate` is still null (race when backgrounding
+   * during startup). Forwarding to [reactDelegate] only skips the broken requireNonNull path.
+   */
+  override fun onUserLeaveHint() {
+    super<AppCompatActivity>.onUserLeaveHint()
+    reactDelegate?.onUserLeaveHint()
   }
 }

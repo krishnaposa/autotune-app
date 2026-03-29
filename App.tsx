@@ -1,10 +1,7 @@
-import 'react-native-gesture-handler';
-import 'react-native-reanimated';
-import 'react-native-worklets';
-
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Platform,
+  Pressable,
   StyleSheet,
   Switch,
   Text,
@@ -17,9 +14,20 @@ import {
   requestRecordingPermissionsAsync,
   setAudioModeAsync,
   useAudioPlayer,
+  useAudioPlayerStatus,
 } from 'expo-audio';
+import * as FileSystem from 'expo-file-system/legacy';
 import { AudioContext, AudioManager, AudioRecorder } from './audioApi';
 import LivePitchDetection from './livePitch';
+import { downloadRecording } from './downloadRecording';
+import {
+  createPitchRingState,
+  pitchShiftRingBlock,
+  resetPitchRingState,
+} from './pitchShiftRing';
+import { encodeWavMonoFloat32, uint8ArrayToBase64 } from './wavEncode';
+
+void SplashScreen.preventAutoHideAsync();
 
 const A4 = 440;
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -115,42 +123,12 @@ function autoCorrelate(buf: Float32Array, sampleRate: number): number {
   return f;
 }
 
-/** Resample in-block for pitch shift: readPos advances by (target/input) per output sample. */
-function pitchShiftBlock(
-  input: Float32Array,
-  ratio: number,
-  readOffsetRef: React.MutableRefObject<number>
-): Float32Array {
-  const out = new Float32Array(input.length);
-  if (ratio <= 0 || !isFinite(ratio) || input.length < 2) {
-    out.set(input);
-    return out;
-  }
-  let readPos = readOffsetRef.current;
-  const n = input.length;
-  for (let i = 0; i < out.length; i++) {
-    const base = Math.floor(readPos);
-    const i0 = ((base % n) + n) % n;
-    const i1 = (i0 + 1) % n;
-    const frac = readPos - base;
-    const s0 = input[i0];
-    const s1 = input[i1];
-    out[i] = s0 * (1 - frac) + s1 * frac;
-    readPos += ratio;
-  }
-  readOffsetRef.current = readPos % n;
-  return out;
-}
+/** Smoothed pitch ratio toward target (less zipper noise). */
+const RATIO_SMOOTH_ATTACK = 0.97;
+const RATIO_SMOOTH_RELEASE = 0.995;
 
 export default function App() {
   const { width } = useWindowDimensions();
-
-  /** Keeps the expo-audio player subsystem initialized alongside the monitor pipeline. */
-  useAudioPlayer(null);
-
-  useEffect(() => {
-    void SplashScreen.hideAsync();
-  }, []);
 
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [inputHz, setInputHz] = useState(0);
@@ -159,14 +137,31 @@ export default function App() {
   const [targetNote, setTargetNote] = useState('A4');
   const [monitorOn, setMonitorOn] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [savedPlaybackUri, setSavedPlaybackUri] = useState<string | null>(null);
+  const [captureDurationSec, setCaptureDurationSec] = useState<number | null>(null);
+
+  const captureActiveRef = useRef(false);
+  const captureChunksRef = useRef<Float32Array[]>([]);
+  const monitorSampleRateRef = useRef(44100);
+  const webBlobUrlRef = useRef<string | null>(null);
+
+  const playbackPlayer = useAudioPlayer(null);
+  const playbackStatus = useAudioPlayerStatus(playbackPlayer);
 
   const ratioSmoothed = useRef(1);
-  const readPhase = useRef(0);
+  const pitchRingStateRef = useRef(createPitchRingState());
   const pitchSubRef = useRef<ReturnType<typeof LivePitchDetection.addListener> | null>(null);
 
   const audioRecorderRef = useRef<AudioRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const queueRef = useRef<ReturnType<AudioContext['createBufferQueueSource']> | null>(null);
+
+  useEffect(() => {
+    if (savedPlaybackUri) {
+      playbackPlayer.replace({ uri: savedPlaybackUri });
+    }
+  }, [savedPlaybackUri, playbackPlayer]);
 
   const updateTargetFromHz = useCallback((hz: number) => {
     if (hz <= 0 || !isFinite(hz)) return;
@@ -219,8 +214,8 @@ export default function App() {
     audioRecorderRef.current = null;
     audioContextRef.current = null;
     queueRef.current = null;
-    readPhase.current = 0;
     ratioSmoothed.current = 1;
+    resetPitchRingState(pitchRingStateRef.current);
     await AudioManager.setAudioSessionActivity(false);
   }, []);
 
@@ -231,6 +226,8 @@ export default function App() {
     }
     setError(null);
     await stopLivePitch();
+    ratioSmoothed.current = 1;
+    resetPitchRingState(pitchRingStateRef.current);
 
     const perm = await AudioManager.requestRecordingPermissions();
     if (perm !== 'Granted') {
@@ -251,7 +248,8 @@ export default function App() {
     }
 
     const sampleRate = AudioManager.getDevicePreferredSampleRate() || 44100;
-    const bufferFrames = 512;
+    monitorSampleRateRef.current = sampleRate;
+    const bufferFrames = 1024;
 
     const audioContext = new AudioContext({ sampleRate });
     const queue = audioContext.createBufferQueueSource();
@@ -284,10 +282,19 @@ export default function App() {
           ratio = fTarget / f;
           setTargetMidi(midiT);
           setTargetNote(formatNote(midiT));
+          ratioSmoothed.current =
+            ratioSmoothed.current * RATIO_SMOOTH_ATTACK + ratio * (1 - RATIO_SMOOTH_ATTACK);
+        } else {
+          ratioSmoothed.current =
+            ratioSmoothed.current * RATIO_SMOOTH_RELEASE + (1 - RATIO_SMOOTH_RELEASE);
         }
-        ratioSmoothed.current = ratioSmoothed.current * 0.92 + ratio * 0.08;
 
-        const shifted = pitchShiftBlock(slice, ratioSmoothed.current, readPhase);
+        const shifted = pitchShiftRingBlock(pitchRingStateRef.current, slice, ratioSmoothed.current);
+        if (captureActiveRef.current) {
+          const copy = new Float32Array(shifted.length);
+          copy.set(shifted);
+          captureChunksRef.current.push(copy);
+        }
         const outBuf = audioContext.createBuffer(1, shifted.length, buffer.sampleRate);
         outBuf.copyToChannel(shifted, 0);
         queue.enqueueBuffer(outBuf);
@@ -305,6 +312,77 @@ export default function App() {
     audioContextRef.current = audioContext;
     queueRef.current = queue;
   }, [stopLivePitch]);
+
+  const finalizeCapture = useCallback(async () => {
+    const chunks = captureChunksRef.current;
+    captureChunksRef.current = [];
+    if (chunks.length === 0) {
+      return;
+    }
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      merged.set(c, off);
+      off += c.length;
+    }
+    const sr = monitorSampleRateRef.current;
+    setCaptureDurationSec(merged.length / sr);
+    const wav = encodeWavMonoFloat32(merged, sr);
+    if (Platform.OS === 'web') {
+      if (webBlobUrlRef.current) {
+        URL.revokeObjectURL(webBlobUrlRef.current);
+        webBlobUrlRef.current = null;
+      }
+      const blob = new Blob([wav], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      webBlobUrlRef.current = url;
+      setSavedPlaybackUri(url);
+    } else {
+      const dir = FileSystem.cacheDirectory;
+      if (!dir) {
+        setError('Could not access app cache to save recording.');
+        return;
+      }
+      const path = `${dir}autotune-capture-${Date.now()}.wav`;
+      await FileSystem.writeAsStringAsync(path, uint8ArrayToBase64(wav), {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      setSavedPlaybackUri(path);
+    }
+  }, []);
+
+  const startCapture = useCallback(() => {
+    captureChunksRef.current = [];
+    captureActiveRef.current = true;
+    setIsCapturing(true);
+    setError(null);
+  }, []);
+
+  const stopCapture = useCallback(() => {
+    captureActiveRef.current = false;
+    setIsCapturing(false);
+    void finalizeCapture();
+  }, [finalizeCapture]);
+
+  const onDownloadRecording = useCallback(async () => {
+    if (!savedPlaybackUri) return;
+    try {
+      setError(null);
+      await downloadRecording(savedPlaybackUri);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [savedPlaybackUri]);
+
+  useEffect(() => {
+    if (monitorOn) return;
+    if (!isCapturing) return;
+    captureActiveRef.current = false;
+    setIsCapturing(false);
+    void finalizeCapture();
+  }, [monitorOn, isCapturing, finalizeCapture]);
 
   useEffect(() => {
     let cancelled = false;
@@ -436,7 +514,7 @@ export default function App() {
   }, [permissionGranted, monitorOn, updateTargetFromHz]);
 
   /**
-   * Web monitor: mic → ScriptProcessor (same C-major snap + pitchShiftBlock as native) → speakers.
+   * Web monitor: mic → ScriptProcessor (same C-major snap + ring-buffer pitch shift as native) → speakers.
    * Higher latency than native; use headphones to reduce feedback.
    */
   useEffect(() => {
@@ -459,7 +537,7 @@ export default function App() {
     }
 
     ratioSmoothed.current = 1;
-    readPhase.current = 0;
+    resetPitchRingState(pitchRingStateRef.current);
 
     (async () => {
       try {
@@ -483,6 +561,7 @@ export default function App() {
       setError(null);
       const ctx = new AC();
       audioCtx = ctx;
+      monitorSampleRateRef.current = ctx.sampleRate;
       sourceNode = ctx.createMediaStreamSource(stream);
 
       const bufferSize = 4096;
@@ -521,9 +600,20 @@ export default function App() {
         } else {
           ratio = 1;
         }
-        ratioSmoothed.current = ratioSmoothed.current * 0.92 + ratio * 0.08;
-        const shifted = pitchShiftBlock(input, ratioSmoothed.current, readPhase);
+        if (f > 0) {
+          ratioSmoothed.current =
+            ratioSmoothed.current * RATIO_SMOOTH_ATTACK + ratio * (1 - RATIO_SMOOTH_ATTACK);
+        } else {
+          ratioSmoothed.current =
+            ratioSmoothed.current * RATIO_SMOOTH_RELEASE + (1 - RATIO_SMOOTH_RELEASE);
+        }
+        const shifted = pitchShiftRingBlock(pitchRingStateRef.current, input, ratioSmoothed.current);
         output.set(shifted);
+        if (captureActiveRef.current) {
+          const copy = new Float32Array(shifted.length);
+          copy.set(shifted);
+          captureChunksRef.current.push(copy);
+        }
       };
 
       sourceNode.connect(processor);
@@ -545,7 +635,7 @@ export default function App() {
       sourceNode = null;
       audioCtx = null;
       ratioSmoothed.current = 1;
-      readPhase.current = 0;
+      resetPitchRingState(pitchRingStateRef.current);
     };
   }, [permissionGranted, monitorOn]);
 
@@ -574,6 +664,48 @@ export default function App() {
           disabled={!permissionGranted}
         />
       </View>
+
+      {monitorOn ? (
+        <View style={styles.recordSection}>
+          <Text style={styles.sectionLabel}>Save monitor output</Text>
+          <Text style={styles.sectionHint}>
+            Records the pitch-shifted signal you hear (WAV). Use headphones to avoid feedback. After saving, use
+            Download to save the file{Platform.OS === 'web' ? ' (browser download folder)' : ' via the share sheet'}.
+          </Text>
+          <View style={styles.btnRow}>
+            {!isCapturing ? (
+              <Pressable style={styles.btn} onPress={startCapture}>
+                <Text style={styles.btnText}>Start recording</Text>
+              </Pressable>
+            ) : (
+              <Pressable style={[styles.btn, styles.btnStop]} onPress={stopCapture}>
+                <Text style={styles.btnText}>Stop & save</Text>
+              </Pressable>
+            )}
+          </View>
+          {savedPlaybackUri ? (
+            <View style={styles.playbackBlock}>
+              <Text style={styles.savedMeta}>
+                {captureDurationSec != null ? `${captureDurationSec.toFixed(1)} s` : 'Clip'} — tap Listen to preview
+              </Text>
+              <View style={styles.playbackRow}>
+                <Pressable
+                  style={styles.btn}
+                  onPress={() => {
+                    if (playbackStatus?.playing) playbackPlayer.pause();
+                    else playbackPlayer.play();
+                  }}
+                >
+                  <Text style={styles.btnText}>{playbackStatus?.playing ? 'Pause' : 'Listen'}</Text>
+                </Pressable>
+                <Pressable style={[styles.btn, styles.btnDownload]} onPress={onDownloadRecording}>
+                  <Text style={styles.btnText}>Download</Text>
+                </Pressable>
+              </View>
+            </View>
+          ) : null}
+        </View>
+      ) : null}
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
 
@@ -728,5 +860,65 @@ const styles = StyleSheet.create({
   legendText: {
     color: '#94a3b8',
     fontSize: 12,
+  },
+  recordSection: {
+    marginTop: 4,
+    gap: 8,
+    padding: 14,
+    backgroundColor: '#1e293b',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  sectionLabel: {
+    color: '#e2e8f0',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  sectionHint: {
+    color: '#94a3b8',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  btnRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginTop: 4,
+  },
+  btn: {
+    backgroundColor: '#334155',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignSelf: 'flex-start',
+  },
+  btnStop: {
+    backgroundColor: '#7f1d1d',
+  },
+  btnText: {
+    color: '#f8fafc',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  playbackBlock: {
+    marginTop: 8,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#334155',
+    gap: 8,
+  },
+  playbackRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 10,
+  },
+  savedMeta: {
+    color: '#94a3b8',
+    fontSize: 13,
+  },
+  btnDownload: {
+    backgroundColor: '#0d9488',
   },
 });
