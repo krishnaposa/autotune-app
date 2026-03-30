@@ -1,13 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  Platform,
-  Pressable,
-  StyleSheet,
-  Switch,
-  Text,
-  View,
-  useWindowDimensions,
-} from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Platform, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as SplashScreen from 'expo-splash-screen';
 import {
@@ -26,11 +18,11 @@ import {
   resetPitchRingState,
 } from './pitchShiftRing';
 import { encodeWavMonoFloat32, uint8ArrayToBase64 } from './wavEncode';
+import { isBluetoothInputAvailable, setBluetoothScoInputEnabled } from './bluetoothInput';
 
 void SplashScreen.preventAutoHideAsync();
 
 const A4 = 440;
-const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 /** MIDI pitch classes in C major (C, D, E, F, G, A, B). */
 const C_MAJOR_PC = new Set([0, 2, 4, 5, 7, 9, 11]);
 
@@ -40,13 +32,6 @@ function freqToMidi(f: number): number {
 
 function midiToFreq(m: number): number {
   return A4 * Math.pow(2, (m - 69) / 12);
-}
-
-function formatNote(midi: number): string {
-  const n = Math.round(midi);
-  const pc = ((n % 12) + 12) % 12;
-  const octave = Math.floor(n / 12) - 1;
-  return `${NOTE_NAMES[pc]}${octave}`;
 }
 
 /** Nearest MIDI note that lies in C major (any octave). */
@@ -127,19 +112,49 @@ function autoCorrelate(buf: Float32Array, sampleRate: number): number {
 const RATIO_SMOOTH_ATTACK = 0.97;
 const RATIO_SMOOTH_RELEASE = 0.995;
 
-export default function App() {
-  const { width } = useWindowDimensions();
+type WebAudioInputOption = { deviceId: string; label: string };
 
+function webMicConstraints(deviceId: string | null, monitorProcessing: boolean): MediaStreamConstraints {
+  const audio: boolean | MediaTrackConstraints =
+    deviceId == null
+      ? monitorProcessing
+        ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        : true
+      : monitorProcessing
+        ? {
+            deviceId: { exact: deviceId },
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          }
+        : { deviceId: { exact: deviceId } };
+
+  return monitorProcessing ? { audio, video: false } : { audio };
+}
+
+async function enumerateWebAudioInputs(): Promise<WebAudioInputOption[]> {
+  if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) return [];
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices
+    .filter((d) => d.kind === 'audioinput')
+    .map((d, i) => ({
+      deviceId: d.deviceId,
+      label: d.label?.trim() || `Microphone ${i + 1}`,
+    }));
+}
+
+export default function App() {
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [inputHz, setInputHz] = useState(0);
-  const [inputNote, setInputNote] = useState('—');
   const [targetMidi, setTargetMidi] = useState(69);
-  const [targetNote, setTargetNote] = useState('A4');
   const [monitorOn, setMonitorOn] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isCapturing, setIsCapturing] = useState(false);
   const [savedPlaybackUri, setSavedPlaybackUri] = useState<string | null>(null);
   const [captureDurationSec, setCaptureDurationSec] = useState<number | null>(null);
+  const [bluetoothInputOn, setBluetoothInputOn] = useState(false);
+  const [webInputDeviceId, setWebInputDeviceId] = useState<string | null>(null);
+  const [webAudioInputs, setWebAudioInputs] = useState<WebAudioInputOption[]>([]);
 
   const captureActiveRef = useRef(false);
   const captureChunksRef = useRef<Float32Array[]>([]);
@@ -163,12 +178,20 @@ export default function App() {
     }
   }, [savedPlaybackUri, playbackPlayer]);
 
+  const refreshWebAudioInputs = useCallback(async () => {
+    if (Platform.OS !== 'web') return;
+    try {
+      setWebAudioInputs(await enumerateWebAudioInputs());
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const updateTargetFromHz = useCallback((hz: number) => {
     if (hz <= 0 || !isFinite(hz)) return;
     const midi = freqToMidi(hz);
     const snapped = snapMidiToNearestCMajor(midi);
     setTargetMidi(snapped);
-    setTargetNote(formatNote(snapped));
   }, []);
 
   const stopLivePitch = useCallback(() => {
@@ -183,7 +206,6 @@ export default function App() {
       .then(() => {
         pitchSubRef.current = LivePitchDetection.addListener((e) => {
           setInputHz(e.frequency);
-          setInputNote(e.note);
           updateTargetFromHz(e.frequency);
         });
       })
@@ -238,7 +260,8 @@ export default function App() {
     AudioManager.setAudioSessionOptions({
       iosCategory: 'playAndRecord',
       iosMode: 'default',
-      iosOptions: [],
+      iosOptions:
+        Platform.OS === 'ios' && bluetoothInputOn ? ['allowBluetoothHFP', 'allowBluetoothA2DP'] : [],
     });
 
     const ok = await AudioManager.setAudioSessionActivity(true);
@@ -275,13 +298,11 @@ export default function App() {
         let ratio = 1;
         if (f > 0) {
           setInputHz(f);
-          setInputNote(formatNote(freqToMidi(f)));
           const midiIn = freqToMidi(f);
           const midiT = snapMidiToNearestCMajor(midiIn);
           const fTarget = midiToFreq(midiT);
           ratio = fTarget / f;
           setTargetMidi(midiT);
-          setTargetNote(formatNote(midiT));
           ratioSmoothed.current =
             ratioSmoothed.current * RATIO_SMOOTH_ATTACK + ratio * (1 - RATIO_SMOOTH_ATTACK);
         } else {
@@ -311,7 +332,7 @@ export default function App() {
     audioRecorderRef.current = audioRecorder;
     audioContextRef.current = audioContext;
     queueRef.current = queue;
-  }, [stopLivePitch]);
+  }, [stopLivePitch, bluetoothInputOn]);
 
   const finalizeCapture = useCallback(async () => {
     const chunks = captureChunksRef.current;
@@ -419,6 +440,26 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (Platform.OS !== 'android' || !permissionGranted) return;
+    void setBluetoothScoInputEnabled(bluetoothInputOn);
+  }, [bluetoothInputOn, permissionGranted]);
+
+  useEffect(() => {
+    return () => {
+      if (Platform.OS === 'android') void setBluetoothScoInputEnabled(false);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== 'ios' || !permissionGranted) return;
+    AudioManager.setAudioSessionOptions({
+      iosCategory: 'playAndRecord',
+      iosMode: 'default',
+      iosOptions: bluetoothInputOn ? ['allowBluetoothHFP', 'allowBluetoothA2DP'] : [],
+    });
+  }, [bluetoothInputOn, permissionGranted]);
+
+  useEffect(() => {
     if (!permissionGranted) return;
 
     if (monitorOn) {
@@ -439,7 +480,15 @@ export default function App() {
     return () => {
       stopLivePitch();
     };
-  }, [permissionGranted, monitorOn, startLivePitch, startMonitorGraph, stopLivePitch, stopMonitorGraph]);
+  }, [
+    permissionGranted,
+    monitorOn,
+    startLivePitch,
+    startMonitorGraph,
+    stopLivePitch,
+    stopMonitorGraph,
+    bluetoothInputOn,
+  ]);
 
   /** Browser mic → Web Audio AnalyserNode + shared autocorrelation (native uses LivePitchDetection instead). */
   useEffect(() => {
@@ -466,7 +515,7 @@ export default function App() {
 
     (async () => {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia(webMicConstraints(webInputDeviceId, false));
       } catch {
         setError('Allow microphone access to see live pitch on web.');
         return;
@@ -475,6 +524,8 @@ export default function App() {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
+
+      void refreshWebAudioInputs();
 
       setError(null);
       const ctx = new AC();
@@ -492,11 +543,9 @@ export default function App() {
         const f = autoCorrelate(data, ctx.sampleRate);
         if (f > 0) {
           setInputHz(f);
-          setInputNote(formatNote(freqToMidi(f)));
           updateTargetFromHz(f);
         } else {
           setInputHz(0);
-          setInputNote('—');
         }
         rafId = requestAnimationFrame(loop);
       };
@@ -511,7 +560,7 @@ export default function App() {
       stream?.getTracks().forEach((t) => t.stop());
       void browserCtx?.close();
     };
-  }, [permissionGranted, monitorOn, updateTargetFromHz]);
+  }, [permissionGranted, monitorOn, updateTargetFromHz, webInputDeviceId, refreshWebAudioInputs]);
 
   /**
    * Web monitor: mic → ScriptProcessor (same C-major snap + ring-buffer pitch shift as native) → speakers.
@@ -541,14 +590,7 @@ export default function App() {
 
     (async () => {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-          video: false,
-        });
+        stream = await navigator.mediaDevices.getUserMedia(webMicConstraints(webInputDeviceId, true));
       } catch {
         setError('Allow microphone access for monitor on web.');
         return;
@@ -557,6 +599,8 @@ export default function App() {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
+
+      void refreshWebAudioInputs();
 
       setError(null);
       const ctx = new AC();
@@ -593,9 +637,7 @@ export default function App() {
           uiTick += 1;
           if (uiTick % 6 === 0) {
             setInputHz(f);
-            setInputNote(formatNote(midiIn));
             setTargetMidi(midiT);
-            setTargetNote(formatNote(midiT));
           }
         } else {
           ratio = 1;
@@ -637,14 +679,7 @@ export default function App() {
       ratioSmoothed.current = 1;
       resetPitchRingState(pitchRingStateRef.current);
     };
-  }, [permissionGranted, monitorOn]);
-
-  const centsOff = useMemo(() => {
-    if (inputHz <= 0) return 0;
-    return 1200 * Math.log2(midiToFreq(targetMidi) / inputHz);
-  }, [inputHz, targetMidi]);
-
-  const vizWidth = Math.min(width - 48, 360);
+  }, [permissionGranted, monitorOn, webInputDeviceId, refreshWebAudioInputs]);
 
   return (
     <View style={styles.screen}>
@@ -652,9 +687,61 @@ export default function App() {
       <Text style={styles.title}>Autotune monitor</Text>
       <Text style={styles.hint}>
         {Platform.OS === 'web'
-          ? 'Web: pitch readout uses an analyser; turn the monitor on for C-major–snapped audio to your speakers (higher latency than native—headphones help prevent feedback).'
-          : 'Pitch readout uses LivePitchDetection while monitoring is off. On iOS/Android, turning monitoring on releases the pitch module and uses the same audio buffers for pitch + output to avoid microphone conflicts.'}
+          ? 'Web: turn the monitor on for C-major–snapped audio (headphones reduce feedback).'
+          : 'Monitoring uses low-latency native audio; pitch readout uses LivePitchDetection when the monitor is off.'}
       </Text>
+
+      {Platform.OS === 'web' && permissionGranted ? (
+        <View style={styles.webInputSection}>
+          <Text style={styles.sectionLabel}>Bluetooth / headset / mic input</Text>
+          <Text style={styles.btHint}>
+            Browsers do not expose a separate Bluetooth toggle. Pair your headset in the OS, grant mic access, then
+            pick its entry below (often named after the device). Tap Refresh after connecting.
+          </Text>
+          <Pressable style={styles.btn} onPress={() => void refreshWebAudioInputs()}>
+            <Text style={styles.btnText}>Refresh device list</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.deviceChip, webInputDeviceId === null && styles.deviceChipActive]}
+            onPress={() => setWebInputDeviceId(null)}
+          >
+            <Text style={styles.deviceChipText}>System default</Text>
+          </Pressable>
+          <ScrollView style={styles.deviceScroll} nestedScrollEnabled>
+            {webAudioInputs.map((d) => (
+              <Pressable
+                key={d.deviceId}
+                style={[
+                  styles.deviceChip,
+                  webInputDeviceId === d.deviceId && styles.deviceChipActive,
+                ]}
+                onPress={() => setWebInputDeviceId(d.deviceId)}
+              >
+                <Text style={styles.deviceChipText}>{d.label}</Text>
+              </Pressable>
+            ))}
+          </ScrollView>
+        </View>
+      ) : null}
+
+      {(Platform.OS === 'ios' || Platform.OS === 'android') && (
+        <View style={styles.row}>
+          <Text style={styles.label}>Bluetooth headset input</Text>
+          <Switch
+            value={bluetoothInputOn}
+            onValueChange={setBluetoothInputOn}
+            disabled={!permissionGranted}
+          />
+        </View>
+      )}
+      {Platform.OS === 'android' && isBluetoothInputAvailable() ? (
+        <Text style={styles.btHint}>
+          Enables phone-call style routing (SCO) so many Bluetooth mics are used for capture. Pair the
+          headset in system settings first.
+        </Text>
+      ) : Platform.OS === 'ios' ? (
+        <Text style={styles.btHint}>Uses the system audio session so a paired Bluetooth mic can be selected.</Text>
+      ) : null}
 
       <View style={styles.row}>
         <Text style={styles.label}>Low-latency monitor (C major snap)</Text>
@@ -709,45 +796,9 @@ export default function App() {
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
 
-      <View style={styles.metrics}>
-        <View style={styles.metric}>
-          <Text style={styles.metricLabel}>Input</Text>
-          <Text style={styles.metricNote}>{inputNote}</Text>
-          <Text style={styles.metricHz}>{inputHz > 0 ? `${inputHz.toFixed(1)} Hz` : '—'}</Text>
-        </View>
-        <View style={styles.metric}>
-          <Text style={styles.metricLabel}>Target (C major)</Text>
-          <Text style={styles.metricNote}>{targetNote}</Text>
-          <Text style={styles.metricHz}>{inputHz > 0 ? `${midiToFreq(targetMidi).toFixed(1)} Hz` : '—'}</Text>
-        </View>
-      </View>
-
-      <Text style={styles.cents}>
-        {inputHz > 0 ? `Δ ${centsOff >= 0 ? '+' : ''}${centsOff.toFixed(0)} cents vs target` : ''}
-      </Text>
-
-      <View style={[styles.viz, { width: vizWidth }]}>
-        <Text style={styles.vizTitle}>Input vs target</Text>
-        <View style={styles.vizBarTrack}>
-          <View
-            style={[
-              styles.vizInput,
-              {
-                width: `${Math.min(100, (centsOff + 50) / 100) * 100}%`,
-              },
-            ]}
-          />
-        </View>
-        <View style={styles.vizLegend}>
-          <View style={styles.legendItem}>
-            <View style={[styles.dot, { backgroundColor: '#7dd3fc' }]} />
-            <Text style={styles.legendText}>Pointer = cents from target (−50…+50)</Text>
-          </View>
-          <View style={styles.legendItem}>
-            <View style={[styles.dot, { backgroundColor: '#4ade80' }]} />
-            <Text style={styles.legendText}>Center = on target</Text>
-          </View>
-        </View>
+      <View style={styles.pitchCard}>
+        <Text style={styles.pitchLabel}>Live pitch</Text>
+        <Text style={styles.pitchHz}>{inputHz > 0 ? `${inputHz.toFixed(1)} Hz` : '—'}</Text>
       </View>
 
     </View>
@@ -788,78 +839,56 @@ const styles = StyleSheet.create({
     color: '#fca5a5',
     fontSize: 14,
   },
-  metrics: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 8,
+  btHint: {
+    fontSize: 12,
+    color: '#64748b',
+    lineHeight: 17,
+    marginTop: -4,
   },
-  metric: {
-    flex: 1,
+  webInputSection: {
+    gap: 10,
+    marginTop: 4,
+  },
+  deviceScroll: {
+    maxHeight: 160,
+  },
+  deviceChip: {
+    alignSelf: 'stretch',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
     backgroundColor: '#1e293b',
-    borderRadius: 12,
-    padding: 16,
     borderWidth: 1,
     borderColor: '#334155',
+    marginBottom: 6,
   },
-  metricLabel: {
+  deviceChipActive: {
+    borderColor: '#38bdf8',
+    backgroundColor: '#0f172a',
+  },
+  deviceChipText: {
+    color: '#e2e8f0',
+    fontSize: 14,
+  },
+  pitchCard: {
+    backgroundColor: '#1e293b',
+    borderRadius: 12,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#334155',
+    marginTop: 4,
+  },
+  pitchLabel: {
     color: '#94a3b8',
     fontSize: 12,
     textTransform: 'uppercase',
     letterSpacing: 0.6,
     marginBottom: 8,
   },
-  metricNote: {
+  pitchHz: {
     color: '#f1f5f9',
-    fontSize: 28,
+    fontSize: 32,
     fontWeight: '700',
-  },
-  metricHz: {
-    color: '#64748b',
-    fontSize: 14,
-    marginTop: 4,
-  },
-  cents: {
-    color: '#cbd5e1',
-    fontSize: 14,
-    minHeight: 20,
-  },
-  viz: {
-    alignSelf: 'center',
-    marginTop: 8,
-  },
-  vizTitle: {
-    color: '#94a3b8',
-    fontSize: 12,
-    marginBottom: 8,
-  },
-  vizBarTrack: {
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: '#1e293b',
-    overflow: 'hidden',
-  },
-  vizInput: {
-    height: '100%',
-    backgroundColor: '#38bdf8',
-    borderRadius: 6,
-  },
-  vizLegend: {
-    marginTop: 12,
-    gap: 8,
-  },
-  legendItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  dot: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-  },
-  legendText: {
-    color: '#94a3b8',
-    fontSize: 12,
   },
   recordSection: {
     marginTop: 4,

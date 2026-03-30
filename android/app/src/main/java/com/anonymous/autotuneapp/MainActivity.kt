@@ -4,7 +4,6 @@ import expo.modules.splashscreen.SplashScreenManager
 import android.os.Build
 import android.os.Bundle
 
-import androidx.appcompat.app.AppCompatActivity
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.fabricEnabled
@@ -66,12 +65,12 @@ class MainActivity : ReactActivity() {
 
   /**
    * Do not call [ReactActivity.onUserLeaveHint]: it forwards to [ReactActivityDelegate.onUserLeaveHint],
-   * which does `requireNonNull(mReactDelegate)`. Expo's [ReactActivityDelegateWrapper] can run that after
-   * `loadAppReady` while the inner delegate's `mReactDelegate` is still null (race when backgrounding
-   * during startup). Forwarding to [reactDelegate] only skips the broken requireNonNull path.
+   * which does `requireNonNull(mReactDelegate)`. Expo's [ReactActivityDelegateWrapper] can hit that while
+   * the inner delegate's `mReactDelegate` is still null. Kotlin also disallows `super<AppCompatActivity>`
+   * here (not an immediate supertype). Forward straight to [reactDelegate] only; base [Activity] default
+   * for [onUserLeaveHint] is a no-op.
    */
   override fun onUserLeaveHint() {
-    super<AppCompatActivity>.onUserLeaveHint()
     reactDelegate?.onUserLeaveHint()
   }
 }
