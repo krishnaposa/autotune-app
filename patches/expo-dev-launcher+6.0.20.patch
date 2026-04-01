@@ -1,0 +1,26 @@
+diff --git a/node_modules/expo-dev-launcher/android/src/debug/java/expo/modules/devlauncher/compose/models/ErrorViewModel.kt b/node_modules/expo-dev-launcher/android/src/debug/java/expo/modules/devlauncher/compose/models/ErrorViewModel.kt
+index 7d6ed8d..5117901 100644
+--- a/node_modules/expo-dev-launcher/android/src/debug/java/expo/modules/devlauncher/compose/models/ErrorViewModel.kt
++++ b/node_modules/expo-dev-launcher/android/src/debug/java/expo/modules/devlauncher/compose/models/ErrorViewModel.kt
+@@ -3,9 +3,8 @@ package expo.modules.devlauncher.compose.models
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.lifecycle.ViewModel
+ import com.facebook.react.ReactActivity
+-import expo.modules.devlauncher.DevLauncherController
+ import expo.modules.devlauncher.launcher.errors.DevLauncherAppError
+-import expo.modules.devlauncher.services.inject
++import expo.modules.devlauncher.services.DependencyInjection
+ import kotlinx.coroutines.launch
+ 
+ sealed interface ErrorAction {
+@@ -24,7 +23,9 @@ class ErrorViewModel() : ViewModel() {
+   }
+ 
+   fun onAction(action: ErrorAction) {
+-    val devLauncher = inject<DevLauncherController>()
++    // DevLauncherController can be unset when this error UI is shown before DependencyInjection.init
++    // (e.g. early crash). inject<DevLauncherController>() would force-cast null and crash.
++    val devLauncher = DependencyInjection.devLauncherController ?: return
+ 
+     when (action) {
+       is ErrorAction.Reload -> {

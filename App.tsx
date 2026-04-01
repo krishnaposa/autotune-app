@@ -13,44 +13,33 @@ import { AudioContext, AudioManager, AudioRecorder } from './audioApi';
 import LivePitchDetection from './livePitch';
 import { downloadRecording } from './downloadRecording';
 import {
+  A4,
+  createNoteLockState,
+  freqToMidi,
+  midiToFreq,
+  nextLockedMidi,
+  resetNoteLockState,
+  snapMidiToNearestCMajor,
+} from './pitchAutotune';
+import {
   createPitchRingState,
   pitchShiftRingBlock,
   resetPitchRingState,
 } from './pitchShiftRing';
+import {
+  createMicNoiseReduceState,
+  reduceMicNoise,
+  resetMicNoiseReduceState,
+} from './micNoiseReduce';
 import { encodeWavMonoFloat32, uint8ArrayToBase64 } from './wavEncode';
 import { isBluetoothInputAvailable, setBluetoothScoInputEnabled } from './bluetoothInput';
 
 void SplashScreen.preventAutoHideAsync();
 
-const A4 = 440;
-/** MIDI pitch classes in C major (C, D, E, F, G, A, B). */
-const C_MAJOR_PC = new Set([0, 2, 4, 5, 7, 9, 11]);
-
-function freqToMidi(f: number): number {
-  return 12 * Math.log2(f / A4) + 69;
-}
-
-function midiToFreq(m: number): number {
-  return A4 * Math.pow(2, (m - 69) / 12);
-}
-
-/** Nearest MIDI note that lies in C major (any octave). */
-function snapMidiToNearestCMajor(midi: number): number {
-  const lo = Math.floor(midi) - 6;
-  const hi = Math.ceil(midi) + 6;
-  let best = Math.round(midi);
-  let bestDist = Infinity;
-  for (let m = lo; m <= hi; m++) {
-    const pc = ((m % 12) + 12) % 12;
-    if (!C_MAJOR_PC.has(pc)) continue;
-    const d = Math.abs(midi - m);
-    if (d < bestDist) {
-      bestDist = d;
-      best = m;
-    }
-  }
-  return best;
-}
+/** Blocks before changing locked scale note (native ~1024-sample blocks). */
+const NOTE_LOCK_STREAK_NATIVE = 5;
+/** Web uses larger ScriptProcessor buffers — shorter streak keeps note changes responsive. */
+const NOTE_LOCK_STREAK_WEB = 2;
 
 /** Classic autocorrelation pitch estimate (returns Hz or -1 if unclear). */
 function autoCorrelate(buf: Float32Array, sampleRate: number): number {
@@ -108,26 +97,22 @@ function autoCorrelate(buf: Float32Array, sampleRate: number): number {
   return f;
 }
 
-/** Smoothed pitch ratio toward target (less zipper noise). */
-const RATIO_SMOOTH_ATTACK = 0.97;
-const RATIO_SMOOTH_RELEASE = 0.995;
+/** Smoothed pitch ratio toward target (less zipper / warble from jittery pitch estimates). */
+const RATIO_SMOOTH_ATTACK = 0.992;
+const RATIO_SMOOTH_RELEASE = 0.998;
 
 type WebAudioInputOption = { deviceId: string; label: string };
 
 function webMicConstraints(deviceId: string | null, monitorProcessing: boolean): MediaStreamConstraints {
-  const audio: boolean | MediaTrackConstraints =
+  const enhanced: MediaTrackConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
+  const audio: MediaTrackConstraints =
     deviceId == null
-      ? monitorProcessing
-        ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-        : true
-      : monitorProcessing
-        ? {
-            deviceId: { exact: deviceId },
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          }
-        : { deviceId: { exact: deviceId } };
+      ? enhanced
+      : { deviceId: { exact: deviceId }, ...enhanced };
 
   return monitorProcessing ? { audio, video: false } : { audio };
 }
@@ -155,6 +140,9 @@ export default function App() {
   const [bluetoothInputOn, setBluetoothInputOn] = useState(false);
   const [webInputDeviceId, setWebInputDeviceId] = useState<string | null>(null);
   const [webAudioInputs, setWebAudioInputs] = useState<WebAudioInputOption[]>([]);
+  const [noiseReduceOn, setNoiseReduceOn] = useState(true);
+  const noiseReduceOnRef = useRef(true);
+  noiseReduceOnRef.current = noiseReduceOn;
 
   const captureActiveRef = useRef(false);
   const captureChunksRef = useRef<Float32Array[]>([]);
@@ -165,12 +153,14 @@ export default function App() {
   const playbackStatus = useAudioPlayerStatus(playbackPlayer);
 
   const ratioSmoothed = useRef(1);
+  const noteLockRef = useRef(createNoteLockState());
   const pitchRingStateRef = useRef(createPitchRingState());
   const pitchSubRef = useRef<ReturnType<typeof LivePitchDetection.addListener> | null>(null);
 
   const audioRecorderRef = useRef<AudioRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const queueRef = useRef<ReturnType<AudioContext['createBufferQueueSource']> | null>(null);
+  const micNoiseStateRef = useRef(createMicNoiseReduceState());
 
   useEffect(() => {
     if (savedPlaybackUri) {
@@ -237,7 +227,9 @@ export default function App() {
     audioContextRef.current = null;
     queueRef.current = null;
     ratioSmoothed.current = 1;
+    resetNoteLockState(noteLockRef.current);
     resetPitchRingState(pitchRingStateRef.current);
+    resetMicNoiseReduceState(micNoiseStateRef.current);
     await AudioManager.setAudioSessionActivity(false);
   }, []);
 
@@ -249,7 +241,9 @@ export default function App() {
     setError(null);
     await stopLivePitch();
     ratioSmoothed.current = 1;
+    resetNoteLockState(noteLockRef.current);
     resetPitchRingState(pitchRingStateRef.current);
+    resetMicNoiseReduceState(micNoiseStateRef.current);
 
     const perm = await AudioManager.requestRecordingPermissions();
     if (perm !== 'Granted') {
@@ -294,23 +288,33 @@ export default function App() {
       ({ buffer, numFrames }) => {
         const input = buffer.getChannelData(0);
         const slice = input.subarray(0, numFrames);
-        const f = autoCorrelate(slice, buffer.sampleRate);
+        const cleaned = reduceMicNoise(
+          slice,
+          buffer.sampleRate,
+          micNoiseStateRef.current,
+          noiseReduceOnRef.current
+        );
+        const f = autoCorrelate(cleaned, buffer.sampleRate);
         let ratio = 1;
         if (f > 0) {
           setInputHz(f);
           const midiIn = freqToMidi(f);
-          const midiT = snapMidiToNearestCMajor(midiIn);
+          const midiT = nextLockedMidi(noteLockRef.current, midiIn, NOTE_LOCK_STREAK_NATIVE);
           const fTarget = midiToFreq(midiT);
           ratio = fTarget / f;
           setTargetMidi(midiT);
           ratioSmoothed.current =
             ratioSmoothed.current * RATIO_SMOOTH_ATTACK + ratio * (1 - RATIO_SMOOTH_ATTACK);
         } else {
-          ratioSmoothed.current =
-            ratioSmoothed.current * RATIO_SMOOTH_RELEASE + (1 - RATIO_SMOOTH_RELEASE);
+          // While recording, keep the last correction so breaths/consonants stay tuned in the WAV.
+          if (!captureActiveRef.current) {
+            ratioSmoothed.current =
+              ratioSmoothed.current * RATIO_SMOOTH_RELEASE + (1 - RATIO_SMOOTH_RELEASE);
+          }
         }
 
-        const shifted = pitchShiftRingBlock(pitchRingStateRef.current, slice, ratioSmoothed.current);
+        // Same signal as speakers: C-major snap + ring pitch shift (this is what we encode to WAV).
+        const shifted = pitchShiftRingBlock(pitchRingStateRef.current, cleaned, ratioSmoothed.current);
         if (captureActiveRef.current) {
           const copy = new Float32Array(shifted.length);
           copy.set(shifted);
@@ -586,7 +590,9 @@ export default function App() {
     }
 
     ratioSmoothed.current = 1;
+    resetNoteLockState(noteLockRef.current);
     resetPitchRingState(pitchRingStateRef.current);
+    resetMicNoiseReduceState(micNoiseStateRef.current);
 
     (async () => {
       try {
@@ -627,11 +633,12 @@ export default function App() {
         const input = ev.inputBuffer.getChannelData(0);
         const output = ev.outputBuffer.getChannelData(0);
         const sr = ctx.sampleRate;
-        const f = autoCorrelate(input, sr);
+        const cleaned = reduceMicNoise(input, sr, micNoiseStateRef.current, noiseReduceOnRef.current);
+        const f = autoCorrelate(cleaned, sr);
         let ratio = 1;
         if (f > 0) {
           const midiIn = freqToMidi(f);
-          const midiT = snapMidiToNearestCMajor(midiIn);
+          const midiT = nextLockedMidi(noteLockRef.current, midiIn, NOTE_LOCK_STREAK_WEB);
           const fTarget = midiToFreq(midiT);
           ratio = fTarget / f;
           uiTick += 1;
@@ -646,10 +653,12 @@ export default function App() {
           ratioSmoothed.current =
             ratioSmoothed.current * RATIO_SMOOTH_ATTACK + ratio * (1 - RATIO_SMOOTH_ATTACK);
         } else {
-          ratioSmoothed.current =
-            ratioSmoothed.current * RATIO_SMOOTH_RELEASE + (1 - RATIO_SMOOTH_RELEASE);
+          if (!captureActiveRef.current) {
+            ratioSmoothed.current =
+              ratioSmoothed.current * RATIO_SMOOTH_RELEASE + (1 - RATIO_SMOOTH_RELEASE);
+          }
         }
-        const shifted = pitchShiftRingBlock(pitchRingStateRef.current, input, ratioSmoothed.current);
+        const shifted = pitchShiftRingBlock(pitchRingStateRef.current, cleaned, ratioSmoothed.current);
         output.set(shifted);
         if (captureActiveRef.current) {
           const copy = new Float32Array(shifted.length);
@@ -677,12 +686,14 @@ export default function App() {
       sourceNode = null;
       audioCtx = null;
       ratioSmoothed.current = 1;
+      resetNoteLockState(noteLockRef.current);
       resetPitchRingState(pitchRingStateRef.current);
+      resetMicNoiseReduceState(micNoiseStateRef.current);
     };
   }, [permissionGranted, monitorOn, webInputDeviceId, refreshWebAudioInputs]);
 
-  return (
-    <View style={styles.screen}>
+  const body = (
+    <>
       <StatusBar style="light" />
       <Text style={styles.title}>Autotune monitor</Text>
       <Text style={styles.hint}>
@@ -707,7 +718,7 @@ export default function App() {
           >
             <Text style={styles.deviceChipText}>System default</Text>
           </Pressable>
-          <ScrollView style={styles.deviceScroll} nestedScrollEnabled>
+          <ScrollView style={styles.deviceScroll} nestedScrollEnabled showsVerticalScrollIndicator>
             {webAudioInputs.map((d) => (
               <Pressable
                 key={d.deviceId}
@@ -752,12 +763,29 @@ export default function App() {
         />
       </View>
 
+      <View style={styles.row}>
+        <Text style={styles.label}>Reduce background noise</Text>
+        <Switch
+          value={noiseReduceOn}
+          onValueChange={(v) => {
+            resetMicNoiseReduceState(micNoiseStateRef.current);
+            setNoiseReduceOn(v);
+          }}
+          disabled={!permissionGranted}
+        />
+      </View>
+      <Text style={styles.btHint}>
+        High-pass + soft gate on the mic while the monitor runs (web: also uses browser noise suppression). Turn off if
+        your voice sounds thin or chopped.
+      </Text>
+
       {monitorOn ? (
         <View style={styles.recordSection}>
           <Text style={styles.sectionLabel}>Save monitor output</Text>
           <Text style={styles.sectionHint}>
-            Records the pitch-shifted signal you hear (WAV). Use headphones to avoid feedback. After saving, use
-            Download to save the file{Platform.OS === 'web' ? ' (browser download folder)' : ' via the share sheet'}.
+            Saves the same autotuned (C-major) audio you hear in the monitor — not the dry mic (WAV). Use headphones
+            to avoid feedback. After saving, use Download to save the file
+            {Platform.OS === 'web' ? ' (browser download folder)' : ' via the share sheet'}.
           </Text>
           <View style={styles.btnRow}>
             {!isCapturing ? (
@@ -800,9 +828,23 @@ export default function App() {
         <Text style={styles.pitchLabel}>Live pitch</Text>
         <Text style={styles.pitchHz}>{inputHz > 0 ? `${inputHz.toFixed(1)} Hz` : '—'}</Text>
       </View>
-
-    </View>
+    </>
   );
+
+  if (Platform.OS === 'web') {
+    return (
+      <ScrollView
+        style={styles.screenWebScroll}
+        contentContainerStyle={styles.screenWebScrollContent}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator
+      >
+        {body}
+      </ScrollView>
+    );
+  }
+
+  return <View style={styles.screen}>{body}</View>;
 }
 
 const styles = StyleSheet.create({
@@ -812,6 +854,17 @@ const styles = StyleSheet.create({
     paddingTop: 56,
     paddingHorizontal: 24,
     gap: 16,
+  },
+  screenWebScroll: {
+    flex: 1,
+    backgroundColor: '#0f172a',
+  },
+  screenWebScrollContent: {
+    paddingTop: 56,
+    paddingHorizontal: 24,
+    paddingBottom: 48,
+    gap: 16,
+    flexGrow: 1,
   },
   title: {
     fontSize: 22,
